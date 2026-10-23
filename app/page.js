@@ -235,15 +235,18 @@ export default function Home() {
 
       const newGroup = groupData;
 
-      // 2. Automatically add creator to group_members
+      // 2. Automatically add creator to group_members (ignoring duplicate key if DB trigger already added them)
       const { error: memberErr } = await supabase
         .from('group_members')
         .insert([{ group_id: newGroup.id, user_id: user.id }]);
 
       if (memberErr) {
-        // Handle partial failure honestly with recovery message
-        setGroupError(`Group created, but automatic membership failed: ${memberErr.message}. Please try joining via join code.`);
-        return;
+        const isDuplicate =
+          memberErr.code === '23505' ||
+          (memberErr.message && (memberErr.message.includes('duplicate key') || memberErr.message.includes('already exists')));
+        if (!isDuplicate) {
+          throw memberErr;
+        }
       }
 
       setGroupSuccess(`Group "${newGroup.name}" created successfully! Join code: ${newGroup.join_code}`);
