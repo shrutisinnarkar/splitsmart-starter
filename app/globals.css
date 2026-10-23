@@ -1,10 +1,13 @@
 :root {
-  --blue: #1C5FD4;
-  --cyan: #26C6FF;
-  --ink: #0d1b3e;
-  --muted: #6b7694;
-  --line: #e7ecf5;
-  --bg: #eef2f9;
+  --primary: #7c3aed;
+  --primary-dark: #6d28d9;
+  --primary-light: #f3e8ff;
+  --blue: #7c3aed;
+  --cyan: #a78bfa;
+  --ink: #1e1b4b;
+  --muted: #64748b;
+  --line: #e2e8f0;
+  --bg: #f8f7fc;
   --card: #ffffff;
 }
 
@@ -20,4 +23,4 @@ html, body {
 }
 
 button { font-family: inherit; cursor: pointer; }
-input { font-family: inherit; }
+input, select { font-family: inherit; }

@@ -3,12 +3,6 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabaseClient';
 
-const INITIAL_MEMBERS = ['Shruti', 'Raj', 'Priya', 'Aisha'];
-const SEED = [
-  { id: 'seed-1', emoji: '🍽️', name: 'Dinner', paidBy: 'Aisha', sharedWith: ['Shruti', 'Raj', 'Priya', 'Aisha'], amount: 1800 },
-  { id: 'seed-2', emoji: '🚕', name: 'Cab', paidBy: 'Raj', sharedWith: ['Shruti', 'Raj'], amount: 400 },
-];
-
 const inr = (n) => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 
 export default function Home() {
@@ -19,19 +13,33 @@ export default function Home() {
   const [isSignUp, setIsSignUp] = useState(false);
   const [authError, setAuthError] = useState('');
 
-  const [expenses, setExpenses] = useState(SEED);
-  const [members, setMembers] = useState(INITIAL_MEMBERS);
+  // Groups state
+  const [groups, setGroups] = useState([]);
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [loadingGroups, setLoadingGroups] = useState(false);
+  const [newGroupName, setNewGroupName] = useState('');
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [groupError, setGroupError] = useState('');
+  const [groupSuccess, setGroupSuccess] = useState('');
+  const [copiedCode, setCopiedCode] = useState(false);
+
+  // Active view tab: 'dashboard' | 'expenses' | 'groups' | 'settlements'
+  const [activeTab, setActiveTab] = useState('dashboard');
+
+  // Group data state
+  const [expenses, setExpenses] = useState([]);
+  const [groupMembers, setGroupMembers] = useState([]);
+  const [loadingDb, setLoadingDb] = useState(false);
+  const [dbError, setDbError] = useState('');
+
+  // Add expense form state
   const [expenseName, setExpenseName] = useState('');
   const [expenseAmount, setExpenseAmount] = useState('');
-  const [newMember, setNewMember] = useState('');
-  const [paidBy, setPaidBy] = useState(INITIAL_MEMBERS[0]);
-  const [sharedWith, setSharedWith] = useState(INITIAL_MEMBERS);
-  const [showSplit, setShowSplit] = useState(false);
-  const [dbError, setDbError] = useState('');
+  const [paidBy, setPaidBy] = useState('');
+  const [sharedWith, setSharedWith] = useState([]);
   const [formError, setFormError] = useState('');
-  const [loadingDb, setLoadingDb] = useState(false);
 
-  // Check auth session on mount & subscribe to changes
+  // 1. Auth session on mount
   useEffect(() => {
     let mounted = true;
 
@@ -64,48 +72,118 @@ export default function Home() {
     };
   }, []);
 
-  // Fetch expenses from Supabase when user is logged in
+  // 2. Fetch user's groups when authenticated
   useEffect(() => {
     if (!user) {
-      setExpenses(SEED);
+      setGroups([]);
+      setActiveGroup(null);
       return;
     }
 
-    async function fetchExpenses() {
-      setLoadingDb(true);
-      setDbError('');
+    async function fetchUserGroups() {
+      setLoadingGroups(true);
+      setGroupError('');
       try {
+        // Query group_members joined with groups
         const { data, error } = await supabase
-          .from('expenses')
-          .select('*')
-          .eq('user_id', user.id)
-          .order('created_at', { ascending: false });
+          .from('group_members')
+          .select('group_id, groups(id, name, join_code, created_by, created_at)')
+          .eq('user_id', user.id);
 
         if (error) throw error;
 
-        if (data && data.length > 0) {
-          const formatted = data.map((item) => ({
-            id: item.id,
-            emoji: item.emoji || '🧾',
-            name: item.name,
-            paidBy: item.paid_by || members[0],
-            sharedWith: Array.isArray(item.shared_with) ? item.shared_with : (typeof item.shared_with === 'string' ? JSON.parse(item.shared_with) : members),
-            amount: Number(item.amount),
-          }));
-          setExpenses(formatted);
+        const fetchedGroups = (data || [])
+          .map((item) => item.groups)
+          .filter(Boolean);
+
+        setGroups(fetchedGroups);
+
+        // Set active group if not already set or if active group no longer in list
+        if (fetchedGroups.length > 0) {
+          setActiveGroup((prev) => {
+            if (!prev || !fetchedGroups.some((g) => g.id === prev.id)) {
+              return fetchedGroups[0];
+            }
+            return prev;
+          });
         } else {
-          setExpenses([]);
+          setActiveGroup(null);
         }
       } catch (err) {
-        setDbError('Failed to load expenses from Supabase: ' + err.message);
+        setGroupError('Failed to load groups: ' + err.message);
+      } finally {
+        setLoadingGroups(false);
+      }
+    }
+
+    fetchUserGroups();
+  }, [user]);
+
+  // 3. Fetch expenses and group members when activeGroup changes
+  useEffect(() => {
+    if (!user || !activeGroup) {
+      setExpenses([]);
+      setGroupMembers([]);
+      return;
+    }
+
+    async function fetchGroupData() {
+      setLoadingDb(true);
+      setDbError('');
+      try {
+        // Fetch group members from group_members (and user emails if available or map user IDs)
+        const { data: memberData, error: memberError } = await supabase
+          .from('group_members')
+          .select('user_id')
+          .eq('group_id', activeGroup.id);
+
+        if (memberError) throw memberError;
+
+        // Extract member identifiers (using user email if available, or user id prefix)
+        // Since we can't always read auth.users directly without an RPC/profile table, we use user id or email if stored, or fallback to user IDs / email mapping
+        const membersList = (memberData || []).map((m) => {
+          // If the member is the current user, show their email or 'You'/'Creator', else fallback to short ID
+          if (m.user_id === user.id) return user.email || 'You';
+          return 'User ' + m.user_id.substring(0, 6);
+        });
+
+        // Ensure unique members and ensure current user is included
+        const uniqueMembers = Array.from(new Set(membersList));
+        if (uniqueMembers.length === 0) uniqueMembers.push(user.email || 'You');
+        setGroupMembers(uniqueMembers);
+        setPaidBy(uniqueMembers[0]);
+        setSharedWith(uniqueMembers);
+
+        // Fetch expenses for active group
+        const { data: expData, error: expError } = await supabase
+          .from('expenses')
+          .select('*')
+          .eq('group_id', activeGroup.id)
+          .order('created_at', { ascending: false });
+
+        if (expError) throw expError;
+
+        const formattedExpenses = (expData || []).map((item) => ({
+          id: item.id,
+          emoji: item.emoji || '🧾',
+          name: item.name,
+          paidBy: item.paid_by || uniqueMembers[0],
+          sharedWith: Array.isArray(item.shared_with) ? item.shared_with : (typeof item.shared_with === 'string' ? JSON.parse(item.shared_with) : uniqueMembers),
+          amount: Number(item.amount),
+        }));
+
+        setExpenses(formattedExpenses);
+      } catch (err) {
+        setDbError('Failed to load group data: ' + err.message);
       } finally {
         setLoadingDb(false);
       }
     }
 
-    fetchExpenses();
-  }, [user]);
+    fetchGroupData();
+  }, [user, activeGroup]);
 
+  // Auth actions
   const handleAuth = async (e) => {
     e.preventDefault();
     setAuthError('');
@@ -134,17 +212,107 @@ export default function Home() {
     else setUser(null);
   };
 
-  const total = expenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+  // Group actions
+  const handleCreateGroup = async (e) => {
+    e.preventDefault();
+    setGroupError('');
+    setGroupSuccess('');
+    const gName = newGroupName.trim();
+    if (!gName) {
+      setGroupError('Please enter a group name.');
+      return;
+    }
 
+    try {
+      // 1. Insert into groups
+      const { data: groupData, error: groupErr } = await supabase
+        .from('groups')
+        .insert([{ name: gName, created_by: user.id }])
+        .select()
+        .single();
+
+      if (groupErr) throw groupErr;
+
+      const newGroup = groupData;
+
+      // 2. Automatically add creator to group_members
+      const { error: memberErr } = await supabase
+        .from('group_members')
+        .insert([{ group_id: newGroup.id, user_id: user.id }]);
+
+      if (memberErr) {
+        // Handle partial failure honestly with recovery message
+        setGroupError(`Group created, but automatic membership failed: ${memberErr.message}. Please try joining via join code.`);
+        return;
+      }
+
+      setGroupSuccess(`Group "${newGroup.name}" created successfully! Join code: ${newGroup.join_code}`);
+      setNewGroupName('');
+
+      // Refresh groups list
+      setGroups((prev) => [newGroup, ...prev]);
+      setActiveGroup(newGroup);
+    } catch (err) {
+      setGroupError('Failed to create group: ' + err.message);
+    }
+  };
+
+  const handleJoinGroup = async (e) => {
+    e.preventDefault();
+    setGroupError('');
+    setGroupSuccess('');
+    const code = joinCodeInput.trim().toUpperCase();
+    if (!code) {
+      setGroupError('Please enter a join code.');
+      return;
+    }
+
+    try {
+      // Call Supabase RPC join_group(code)
+      const { data, error } = await supabase.rpc('join_group', { code });
+      if (error) throw error;
+
+      setGroupSuccess('Successfully joined group!');
+      setJoinCodeInput('');
+
+      // Refresh groups
+      const { data: memberData, error: memErr } = await supabase
+        .from('group_members')
+        .select('group_id, groups(id, name, join_code, created_by, created_at)')
+        .eq('user_id', user.id);
+
+      if (!memErr && memberData) {
+        const fetchedGroups = memberData.map((item) => item.groups).filter(Boolean);
+        setGroups(fetchedGroups);
+        const joinedGroup = fetchedGroups.find((g) => g.join_code === code);
+        if (joinedGroup) setActiveGroup(joinedGroup);
+      }
+    } catch (err) {
+      setGroupError('Failed to join group (invalid code or already a member): ' + err.message);
+    }
+  };
+
+  const copyJoinCode = (code) => {
+    navigator.clipboard.writeText(code);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  // Expense CRUD actions
   const addExpense = async () => {
     setFormError('');
     setDbError('');
+
+    if (!activeGroup) {
+      setFormError('Please select or create an active group first.');
+      return;
+    }
 
     const name = expenseName.trim();
     const amount = Number(expenseAmount);
 
     if (!name) {
-      setFormError('Please enter an expense name.');
+      setFormError('Please enter an expense description.');
       return;
     }
     if (isNaN(amount) || amount <= 0) {
@@ -153,29 +321,12 @@ export default function Home() {
     }
 
     const formattedName = name.charAt(0).toUpperCase() + name.slice(1);
-    const chosenPaidBy = paidBy || members[0] || 'Shruti';
-    // Use strictly the explicitly selected sharedWith members, or default to all members if none selected
-    const chosenSharedWith = sharedWith.length > 0 ? sharedWith : members;
+    const chosenPaidBy = paidBy || groupMembers[0] || (user.email || 'You');
+    const chosenSharedWith = sharedWith.length > 0 ? sharedWith : groupMembers;
 
-    if (!user) {
-      // Local demo mode
-      const newExp = {
-        id: 'e-' + Date.now(),
-        emoji: '🧾',
-        name: formattedName,
-        paidBy: chosenPaidBy,
-        sharedWith: chosenSharedWith,
-        amount,
-      };
-      setExpenses((list) => [...list, newExp]);
-      setExpenseName('');
-      setExpenseAmount('');
-      return;
-    }
-
-    // Supabase insert
     try {
       const payload = {
+        group_id: activeGroup.id,
         user_id: user.id,
         name: formattedName,
         emoji: '🧾',
@@ -194,49 +345,32 @@ export default function Home() {
           emoji: item.emoji || '🧾',
           name: item.name,
           paidBy: item.paid_by,
-          sharedWith: item.shared_with || members,
+          sharedWith: item.shared_with || groupMembers,
           amount: Number(item.amount),
         };
-        setExpenses((list) => [...list, newExp]);
+        setExpenses((list) => [newExp, ...list]);
         setExpenseName('');
         setExpenseAmount('');
       }
     } catch (err) {
-      setDbError('Failed to add expense to Supabase: ' + err.message);
+      setDbError('Failed to add expense: ' + err.message);
     }
   };
 
   const removeExpense = async (id) => {
     setDbError('');
-    if (!user || String(id).startsWith('seed-')) {
-      setExpenses((list) => list.filter((e) => e.id !== id));
-      return;
-    }
-
     try {
-      const { error } = await supabase.from('expenses').delete().eq('id', id).eq('user_id', user.id);
+      const { error } = await supabase
+        .from('expenses')
+        .delete()
+        .eq('id', id)
+        .eq('group_id', activeGroup.id);
+
       if (error) throw error;
       setExpenses((list) => list.filter((e) => e.id !== id));
     } catch (err) {
-      setDbError('Failed to delete expense from Supabase: ' + err.message);
+      setDbError('Failed to delete expense: ' + err.message);
     }
-  };
-
-  const addMember = () => {
-    const m = newMember.trim();
-    if (!m || members.includes(m)) return;
-    const updated = [...members, m];
-    setMembers(updated);
-    setSharedWith((prev) => [...prev, m]);
-    setNewMember('');
-  };
-
-  const removeMember = (m) => {
-    if (members.length <= 1) return;
-    const updated = members.filter((item) => item !== m);
-    setMembers(updated);
-    if (paidBy === m) setPaidBy(updated[0]);
-    setSharedWith((prev) => prev.filter((item) => item !== m));
   };
 
   const toggleShareWith = (m) => {
@@ -245,13 +379,15 @@ export default function Home() {
     );
   };
 
-  // Calculate balances & settle up
+  // Calculations for active group
+  const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount || 0), 0);
+
   const balances = {};
-  members.forEach((m) => { balances[m] = 0; });
+  groupMembers.forEach((m) => { balances[m] = 0; });
 
   expenses.forEach((e) => {
     const pBy = e.paidBy;
-    const sharers = e.sharedWith && e.sharedWith.length > 0 ? e.sharedWith : members;
+    const sharers = e.sharedWith && e.sharedWith.length > 0 ? e.sharedWith : groupMembers;
     const amt = Number(e.amount || 0);
     if (balances[pBy] !== undefined) {
       balances[pBy] += amt;
@@ -300,381 +436,614 @@ export default function Home() {
     if (creditor.amount < 0.01) cIdx++;
   }
 
-  return (
-    <main style={styles.page}>
-      <div style={styles.card}>
-        {/* Header */}
-        <div style={styles.header}>
-          <div style={styles.brand}>
-            <div style={styles.logo}>S</div>
-            <div style={styles.title}>Shruti’s SplitSmart</div>
-          </div>
-          <div style={styles.groupPill}>{user ? 'Cloud Sync' : 'Demo Mode'}</div>
-        </div>
+  // Find current user's net balance if they are in groupMembers
+  const currentUserIdentifier = user ? (user.email || 'You') : '';
+  const myNetBalance = balances[currentUserIdentifier] !== undefined ? balances[currentUserIdentifier] : 0;
 
-        {/* Auth Section */}
-        <div style={styles.authBox}>
-          {authLoading ? (
-            <div style={styles.authInfo}>Loading session…</div>
-          ) : user ? (
-            <div style={styles.authLoggedIn}>
-              <span style={styles.authEmail}>{user.email}</span>
-              <button style={styles.authBtn} onClick={handleSignOut}>Sign Out</button>
-            </div>
-          ) : (
-            <form onSubmit={handleAuth} style={styles.authForm}>
-              <div style={styles.authTitle}>{isSignUp ? 'Create Supabase Account' : 'Sign In to Supabase'}</div>
+  if (authLoading) {
+    return (
+      <main style={styles.centerScreen}>
+        <div style={styles.loadingCard}>Loading SplitSmart…</div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main style={styles.authScreen}>
+        <div style={styles.authCard}>
+          <div style={styles.brandRow}>
+            <div style={styles.logo}>S</div>
+            <h1 style={styles.authHeading}>SplitSmart</h1>
+          </div>
+          <p style={styles.authSub}>Collaborative expense splitting for groups, roommates, and trips.</p>
+
+          <form onSubmit={handleAuth} style={styles.authForm}>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Email Address</label>
               <input
                 type="email"
-                placeholder="Email address…"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                style={styles.authInput}
+                placeholder="you@example.com"
+                style={styles.input}
                 required
               />
+            </div>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Password</label>
               <input
                 type="password"
-                placeholder="Password…"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                style={styles.authInput}
+                placeholder="••••••••"
+                style={styles.input}
                 required
               />
-              <div style={styles.authActions}>
-                <button type="submit" style={styles.primaryAuthBtn}>
-                  {isSignUp ? 'Sign Up' : 'Sign In'}
-                </button>
-                <button
-                  type="button"
-                  style={styles.secondaryAuthBtn}
-                  onClick={() => setIsSignUp(!isSignUp)}
-                >
-                  {isSignUp ? 'Have an account? Sign In' : 'Need an account? Sign Up'}
-                </button>
-              </div>
-            </form>
-          )}
-          {authError && <div style={styles.errorText}>{authError}</div>}
-          {dbError && <div style={styles.errorText}>{dbError}</div>}
-        </div>
-
-        {/* Group Members Section */}
-        <div style={styles.section}>
-          <div style={styles.sectionTitle}>Group Members ({members.length})</div>
-          <div style={styles.memberRow}>
-            {members.map((m) => (
-              <span key={m} style={styles.memberTag}>
-                {m}
-                {members.length > 1 && (
-                  <button style={styles.memberRemove} onClick={() => removeMember(m)} aria-label={`Remove ${m}`}>×</button>
-                )}
-              </span>
-            ))}
-          </div>
-          <div style={styles.addRow}>
-            <input
-              style={styles.input}
-              value={newMember}
-              onChange={(e) => setNewMember(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addMember()}
-              placeholder="Add person name…"
-              aria-label="Add person name"
-            />
-            <button style={styles.addBtn} onClick={addMember} aria-label="Add Member">+</button>
-          </div>
-        </div>
-
-        {/* Add an expense */}
-        <div style={styles.section}>
-          <div style={styles.sectionTitle}>Add Expense {user ? '' : '(Local Demo)'}</div>
-          <div style={styles.addExpenseForm}>
-            <div style={styles.addRow}>
-              <input
-                style={styles.input}
-                value={expenseName}
-                onChange={(e) => setExpenseName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && addExpense()}
-                placeholder="Expense name (e.g. Dinner)…"
-                aria-label="Expense name"
-              />
-              <input
-                style={{ ...styles.input, maxWidth: 120 }}
-                type="number"
-                value={expenseAmount}
-                onChange={(e) => setExpenseAmount(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && addExpense()}
-                placeholder="Amount (₹)…"
-                aria-label="Amount"
-                min="0"
-                step="any"
-              />
-              <button style={styles.addBtn} onClick={addExpense} aria-label="Add Expense">+</button>
             </div>
-            {formError && <div style={styles.errorText}>{formError}</div>}
 
-            <div style={styles.optionsGrid}>
-              <div style={styles.optionGroup}>
-                <label style={styles.label}>Paid by:</label>
+            <button type="submit" style={styles.primaryBtn}>
+              {isSignUp ? 'Create Account' : 'Sign In'}
+            </button>
+
+            <button
+              type="button"
+              style={styles.linkBtn}
+              onClick={() => setIsSignUp(!isSignUp)}
+            >
+              {isSignUp ? 'Already have an account? Sign In' : 'Need an account? Sign Up'}
+            </button>
+          </form>
+
+          {authError && <div style={styles.errorBox}>{authError}</div>}
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <div style={styles.dashboardLayout}>
+      {/* Sidebar */}
+      <aside style={styles.sidebar}>
+        <div style={styles.sidebarBrand}>
+          <div style={styles.logo}>S</div>
+          <span style={styles.sidebarTitle}>SplitSmart</span>
+        </div>
+
+        <nav style={styles.navMenu}>
+          <button
+            style={{ ...styles.navItem, ...(activeTab === 'dashboard' ? styles.navItemActive : {}) }}
+            onClick={() => setActiveTab('dashboard')}
+          >
+            📊 Dashboard
+          </button>
+          <button
+            style={{ ...styles.navItem, ...(activeTab === 'expenses' ? styles.navItemActive : {}) }}
+            onClick={() => setActiveTab('expenses')}
+          >
+            💳 Expenses
+          </button>
+          <button
+            style={{ ...styles.navItem, ...(activeTab === 'groups' ? styles.navItemActive : {}) }}
+            onClick={() => setActiveTab('groups')}
+          >
+            👥 Groups ({groups.length})
+          </button>
+          <button
+            style={{ ...styles.navItem, ...(activeTab === 'settlements' ? styles.navItemActive : {}) }}
+            onClick={() => setActiveTab('settlements')}
+          >
+            ⚖️ Settlements
+          </button>
+        </nav>
+
+        <div style={styles.sidebarFooter}>
+          <div style={styles.userInfo}>
+            <span style={styles.userEmailText} title={user.email}>{user.email}</span>
+          </div>
+          <button style={styles.logoutBtn} onClick={handleSignOut}>Sign Out</button>
+        </div>
+      </aside>
+
+      {/* Main Content Area */}
+      <div style={styles.mainContent}>
+        {/* Top Header */}
+        <header style={styles.header}>
+          <div style={styles.headerLeft}>
+            <h2 style={styles.pageTitle}>
+              {activeTab === 'dashboard' && 'Dashboard Overview'}
+              {activeTab === 'expenses' && 'Group Expenses'}
+              {activeTab === 'groups' && 'Manage Groups'}
+              {activeTab === 'settlements' && 'Settle Up & Balances'}
+            </h2>
+          </div>
+
+          <div style={styles.headerRight}>
+            {groups.length > 0 ? (
+              <div style={styles.groupSelectorWrapper}>
+                <span style={styles.selectorLabel}>Active Group:</span>
                 <select
-                  style={styles.select}
-                  value={paidBy}
-                  onChange={(e) => setPaidBy(e.target.value)}
+                  style={styles.groupSelect}
+                  value={activeGroup ? activeGroup.id : ''}
+                  onChange={(e) => {
+                    const found = groups.find((g) => g.id === e.target.value);
+                    if (found) setActiveGroup(found);
+                  }}
                 >
-                  {members.map((m) => (
-                    <option key={m} value={m}>{m}</option>
+                  {groups.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
+                    </option>
                   ))}
                 </select>
               </div>
+            ) : (
+              <button style={styles.headerActionBtn} onClick={() => setActiveTab('groups')}>
+                + Create or Join Group
+              </button>
+            )}
+          </div>
+        </header>
 
-              <div style={styles.optionGroup}>
-                <label style={styles.label}>Shared with ({sharedWith.length}):</label>
-                <div style={styles.checkboxGroup}>
-                  {members.map((m) => (
-                    <label key={m} style={styles.checkboxLabel}>
-                      <input
-                        type="checkbox"
-                        checked={sharedWith.includes(m)}
-                        onChange={() => toggleShareWith(m)}
-                      />
-                      {m}
-                    </label>
-                  ))}
-                </div>
+        {/* View Content */}
+        <div style={styles.contentScroll}>
+          {dbError && <div style={styles.errorBox}>{dbError}</div>}
+          {groupError && <div style={styles.errorBox}>{groupError}</div>}
+          {groupSuccess && <div style={styles.successBox}>{groupSuccess}</div>}
+
+          {/* No Groups Empty State */}
+          {groups.length === 0 ? (
+            <div style={styles.emptyGroupCard}>
+              <div style={styles.emptyIcon}>🏠</div>
+              <h3 style={styles.emptyHeading}>No Groups Found</h3>
+              <p style={styles.emptyText}>You are not a member of any expense group yet. Create your first group or join one using a join code.</p>
+              <div style={styles.emptyActionRow}>
+                <button style={styles.primaryBtn} onClick={() => setActiveTab('groups')}>
+                  Get Started → Create / Join Group
+                </button>
               </div>
             </div>
-          </div>
-        </div>
+          ) : (
+            <>
+              {/* DASHBOARD TAB */}
+              {activeTab === 'dashboard' && (
+                <div style={styles.dashboardGrid}>
+                  {/* Active Group Banner / Card */}
+                  {activeGroup && (
+                    <div style={styles.groupCardBanner}>
+                      <div>
+                        <span style={styles.badge}>Active Group</span>
+                        <h3 style={styles.groupBannerTitle}>{activeGroup.name}</h3>
+                        <p style={styles.groupBannerSub}>Join Code: <b>{activeGroup.join_code}</b></p>
+                      </div>
+                      <button
+                        style={styles.secondaryBtn}
+                        onClick={() => copyJoinCode(activeGroup.join_code)}
+                      >
+                        {copiedCode ? 'Copied! ✓' : '📋 Copy Join Code'}
+                      </button>
+                    </div>
+                  )}
 
-        {/* Expense list */}
-        <div style={styles.section}>
-          <div style={styles.sectionTitle}>Expenses {loadingDb && 'loading…'}</div>
-          <div style={styles.list}>
-            {expenses.length === 0 && (
-              <div style={styles.empty}>No expenses yet — add your first one above.</div>
-            )}
-            {expenses.map((e) => {
-              const sharers = e.sharedWith || members;
-              const eachAmount = e.amount / (sharers.length || 1);
-              return (
-                <div key={e.id} style={styles.item}>
-                  <div style={styles.itemEmoji}>{e.emoji}</div>
-                  <div style={styles.itemMain}>
-                    <div style={styles.itemName}>{e.name}</div>
-                    <div style={styles.itemPaid}>
-                      Paid by <b>{e.paidBy}</b> • Split among {sharers.join(', ')} ({inr(eachAmount)}/ea)
+                  {/* Summary Metric Cards */}
+                  <div style={styles.metricsGrid}>
+                    <div style={styles.metricCard}>
+                      <span style={styles.metricIcon}>💰</span>
+                      <div style={styles.metricLabel}>Total Group Expenses</div>
+                      <div style={styles.metricValue}>{inr(totalExpenses)}</div>
+                    </div>
+                    <div style={styles.metricCard}>
+                      <span style={styles.metricIcon}>👥</span>
+                      <div style={styles.metricLabel}>Group Members</div>
+                      <div style={styles.metricValue}>{groupMembers.length}</div>
+                    </div>
+                    <div style={styles.metricCard}>
+                      <span style={styles.metricIcon}>⚖️</span>
+                      <div style={styles.metricLabel}>Your Net Balance</div>
+                      <div style={{ ...styles.metricValue, color: myNetBalance > 0.01 ? '#16a34a' : myNetBalance < -0.01 ? '#dc2626' : 'var(--ink)' }}>
+                        {myNetBalance > 0 ? `+${inr(myNetBalance)}` : inr(myNetBalance)}
+                      </div>
+                    </div>
+                    <div style={styles.metricCard}>
+                      <span style={styles.metricIcon}>🤝</span>
+                      <div style={styles.metricLabel}>Pending Settlements</div>
+                      <div style={styles.metricValue}>{settleTransactions.length}</div>
                     </div>
                   </div>
-                  <div style={styles.itemAmount}>{inr(e.amount)}</div>
-                  <button style={styles.remove} onClick={() => removeExpense(e.id)} aria-label={`Remove ${e.name}`}>×</button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
 
-        {/* Split Expenses & Settle Up Section */}
-        <div style={styles.section}>
-          <button
-            style={styles.splitToggleBtn}
-            onClick={() => setShowSplit(!showSplit)}
-          >
-            {showSplit ? 'Hide Split & Settle Up' : '⚖️ Split Expenses & Settle Up'}
-          </button>
-
-          {showSplit && (
-            <div style={styles.splitBox}>
-              <div style={styles.subSectionTitle}>Net Balances</div>
-              <div style={styles.balanceList}>
-                {Object.entries(balances).map(([person, bal]) => (
-                  <div key={person} style={styles.balanceItem}>
-                    <span>{person}</span>
-                    <span style={{ fontWeight: 800, color: bal > 0.01 ? '#2f855a' : bal < -0.01 ? '#c53030' : 'var(--ink)' }}>
-                      {bal > 0.01 ? `+${inr(bal)} (Gets back)` : bal < -0.01 ? `${inr(bal)} (Owes)` : 'Settled'}
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              <div style={{ ...styles.subSectionTitle, marginTop: 14 }}>Settle Up (Who pays whom)</div>
-              {settleTransactions.length === 0 ? (
-                <div style={styles.empty}>Everyone is settled up! 🎉</div>
-              ) : (
-                <div style={styles.settleList}>
-                  {settleTransactions.map((tx, idx) => (
-                    <div key={idx} style={styles.settleItem}>
-                      <b>{tx.from}</b> pays <b>{tx.to}</b> <span style={{ color: 'var(--blue)', fontWeight: 800 }}>{inr(tx.amount)}</span>
+                  {/* Quick Actions & Recent Expenses */}
+                  <div style={styles.dashboardTwoColumn}>
+                    <div style={styles.card}>
+                      <h3 style={styles.sectionHeading}>⚡ Quick Actions</h3>
+                      <div style={styles.quickActionsList}>
+                        <button style={styles.actionRowBtn} onClick={() => setActiveTab('expenses')}>
+                          <span>💳 Add New Expense</span>
+                          <span>→</span>
+                        </button>
+                        <button style={styles.actionRowBtn} onClick={() => setActiveTab('settlements')}>
+                          <span>⚖️ View Settle Up Plan</span>
+                          <span>→</span>
+                        </button>
+                        <button style={styles.actionRowBtn} onClick={() => setActiveTab('groups')}>
+                          <span>👥 Invite Members / Join Group</span>
+                          <span>→</span>
+                        </button>
+                      </div>
                     </div>
-                  ))}
+
+                    <div style={styles.card}>
+                      <h3 style={styles.sectionHeading}>🧾 Recent Expenses</h3>
+                      {expenses.length === 0 ? (
+                        <p style={styles.mutedText}>No expenses recorded in this group yet.</p>
+                      ) : (
+                        <div style={styles.miniExpenseList}>
+                          {expenses.slice(0, 4).map((e) => (
+                            <div key={e.id} style={styles.miniExpenseItem}>
+                              <div>
+                                <div style={styles.miniExpName}>{e.name}</div>
+                                <div style={styles.miniExpMeta}>Paid by {e.paidBy}</div>
+                              </div>
+                              <div style={styles.miniExpAmount}>{inr(e.amount)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
-            </div>
+
+              {/* EXPENSES TAB */}
+              {activeTab === 'expenses' && (
+                <div style={styles.sectionContainer}>
+                  {/* Add Expense Form Card */}
+                  <div style={styles.card}>
+                    <h3 style={styles.sectionHeading}>Add New Expense</h3>
+                    <div style={styles.formGrid}>
+                      <div style={styles.formGroup}>
+                        <label style={styles.label}>Description</label>
+                        <input
+                          type="text"
+                          value={expenseName}
+                          onChange={(e) => setExpenseName(e.target.value)}
+                          placeholder="e.g. Dinner, Cab, Groceries"
+                          style={styles.input}
+                        />
+                      </div>
+                      <div style={styles.formGroup}>
+                        <label style={styles.label}>Amount (₹)</label>
+                        <input
+                          type="number"
+                          value={expenseAmount}
+                          onChange={(e) => setExpenseAmount(e.target.value)}
+                          placeholder="0.00"
+                          style={styles.input}
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                    </div>
+
+                    <div style={styles.formGridTwo}>
+                      <div style={styles.formGroup}>
+                        <label style={styles.label}>Paid By</label>
+                        <select
+                          style={styles.select}
+                          value={paidBy}
+                          onChange={(e) => setPaidBy(e.target.value)}
+                        >
+                          {groupMembers.map((m) => (
+                            <option key={m} value={m}>{m}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div style={styles.formGroup}>
+                        <label style={styles.label}>Shared With ({sharedWith.length})</label>
+                        <div style={styles.checkboxGroup}>
+                          {groupMembers.map((m) => (
+                            <label key={m} style={styles.checkboxLabel}>
+                              <input
+                                type="checkbox"
+                                checked={sharedWith.includes(m)}
+                                onChange={() => toggleShareWith(m)}
+                              />
+                              {m}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {formError && <div style={styles.errorBox}>{formError}</div>}
+
+                    <button style={styles.primaryBtn} onClick={addExpense}>
+                      + Add Expense to Group
+                    </button>
+                  </div>
+
+                  {/* Expense List Card */}
+                  <div style={styles.card}>
+                    <h3 style={styles.sectionHeading}>Group Expenses ({expenses.length})</h3>
+                    {expenses.length === 0 ? (
+                      <p style={styles.mutedText}>No expenses recorded yet. Add your first expense above!</p>
+                    ) : (
+                      <div style={styles.expenseTable}>
+                        {expenses.map((e) => {
+                          const sharers = e.sharedWith || groupMembers;
+                          const eachAmt = e.amount / (sharers.length || 1);
+                          return (
+                            <div key={e.id} style={styles.expenseRowItem}>
+                              <div style={styles.expEmojiBox}>{e.emoji}</div>
+                              <div style={styles.expDetails}>
+                                <div style={styles.expName}>{e.name}</div>
+                                <div style={styles.expSub}>
+                                  Paid by <b>{e.paidBy}</b> • Split among {sharers.join(', ')} ({inr(eachAmt)}/ea)
+                                </div>
+                              </div>
+                              <div style={styles.expAmount}>{inr(e.amount)}</div>
+                              <button
+                                style={styles.deleteBtn}
+                                onClick={() => removeExpense(e.id)}
+                                title="Delete expense"
+                              >
+                                ×
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* GROUPS TAB */}
+              {activeTab === 'groups' && (
+                <div style={styles.sectionContainer}>
+                  <div style={styles.groupsGridTwo}>
+                    {/* Create Group Card */}
+                    <div style={styles.card}>
+                      <h3 style={styles.sectionHeading}>Create a New Group</h3>
+                      <form onSubmit={handleCreateGroup}>
+                        <div style={styles.formGroup}>
+                          <label style={styles.label}>Group Name</label>
+                          <input
+                            type="text"
+                            value={newGroupName}
+                            onChange={(e) => setNewGroupName(e.target.value)}
+                            placeholder="e.g. Goa Trip 2026, Apartment 4B"
+                            style={styles.input}
+                            required
+                          />
+                        </div>
+                        <button type="submit" style={styles.primaryBtn}>
+                          Create Group
+                        </button>
+                      </form>
+                    </div>
+
+                    {/* Join Group Card */}
+                    <div style={styles.card}>
+                      <h3 style={styles.sectionHeading}>Join Group with Code</h3>
+                      <form onSubmit={handleJoinGroup}>
+                        <div style={styles.formGroup}>
+                          <label style={styles.label}>Join Code</label>
+                          <input
+                            type="text"
+                            value={joinCodeInput}
+                            onChange={(e) => setJoinCodeInput(e.target.value)}
+                            placeholder="e.g. A3F8K2"
+                            style={styles.input}
+                            required
+                          />
+                        </div>
+                        <button type="submit" style={styles.secondaryBtnWide}>
+                          Join Group
+                        </button>
+                      </form>
+                    </div>
+                  </div>
+
+                  {/* My Groups List Card */}
+                  <div style={styles.card}>
+                    <h3 style={styles.sectionHeading}>Your Groups</h3>
+                    <div style={styles.groupListContainer}>
+                      {groups.map((g) => {
+                        const isActive = activeGroup && activeGroup.id === g.id;
+                        return (
+                          <div
+                            key={g.id}
+                            style={{ ...styles.groupListItem, ...(isActive ? styles.groupListItemActive : {}) }}
+                          >
+                            <div>
+                              <div style={styles.groupItemName}>
+                                {g.name} {isActive && <span style={styles.activePill}>Active</span>}
+                              </div>
+                              <div style={styles.groupItemCode}>Join Code: <b>{g.join_code}</b></div>
+                            </div>
+                            <div style={styles.groupItemActions}>
+                              <button
+                                style={styles.smallBtn}
+                                onClick={() => copyJoinCode(g.join_code)}
+                              >
+                                Copy Code
+                              </button>
+                              {!isActive && (
+                                <button
+                                  style={styles.primarySmallBtn}
+                                  onClick={() => setActiveGroup(g)}
+                                >
+                                  Switch to Group
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* SETTLEMENTS TAB */}
+              {activeTab === 'settlements' && (
+                <div style={styles.sectionContainer}>
+                  <div style={styles.card}>
+                    <h3 style={styles.sectionHeading}>Group Net Balances</h3>
+                    <p style={styles.mutedText}>Positive balances mean members are owed money; negative balances mean members owe money.</p>
+                    <div style={styles.balanceGrid}>
+                      {Object.entries(balances).map(([person, bal]) => (
+                        <div key={person} style={styles.balanceCardItem}>
+                          <div style={styles.balPerson}>{person}</div>
+                          <div style={{ ...styles.balAmount, color: bal > 0.01 ? '#16a34a' : bal < -0.01 ? '#dc2626' : 'var(--ink)' }}>
+                            {bal > 0.01 ? `+${inr(bal)} (Gets back)` : bal < -0.01 ? `${inr(bal)} (Owes)` : 'Settled Up'}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={styles.card}>
+                    <h3 style={styles.sectionHeading}>Settle Up Plan (Optimized Transfers)</h3>
+                    {settleTransactions.length === 0 ? (
+                      <div style={styles.empty}>All balances are settled up! 🎉</div>
+                    ) : (
+                      <div style={styles.settleListContainer}>
+                        {settleTransactions.map((tx, idx) => (
+                          <div key={idx} style={styles.settleRow}>
+                            <div>
+                              <b>{tx.from}</b> pays <b>{tx.to}</b>
+                            </div>
+                            <div style={styles.settleAmountBadge}>{inr(tx.amount)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
-
-        {/* Total */}
-        <div style={styles.total}>Total {inr(total)}</div>
       </div>
-
-      <p style={styles.footnote}>
-        Shruti’s SplitSmart · Supabase Database Integration.<br />
-        {user ? 'Connected to Supabase with RLS enabled.' : 'Sign in to sync expenses with Supabase.'}
-      </p>
-    </main>
+    </div>
   );
 }
 
 const styles = {
-  page: {
-    minHeight: '100vh',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'flex-start',
-    padding: '28px 16px 48px',
-  },
-  card: {
-    width: '100%',
-    maxWidth: 420,
-    background: 'var(--card)',
-    borderRadius: 24,
-    boxShadow: '0 24px 60px -24px rgba(13,27,62,.28)',
-    border: '1px solid var(--line)',
-    padding: 20,
-    marginTop: 12,
-  },
-  header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },
-  brand: { display: 'flex', alignItems: 'center', gap: 10 },
-  logo: {
-    width: 36, height: 36, borderRadius: 11, display: 'grid', placeItems: 'center',
-    color: '#fff', fontWeight: 800, fontSize: 18,
-    background: 'var(--blue)',
-    boxShadow: '0 8px 18px -6px rgba(28,95,212,.55)',
-  },
-  title: { fontSize: 20, fontWeight: 800, letterSpacing: '-0.01em' },
-  groupPill: {
-    fontSize: 12.5, fontWeight: 800, color: 'var(--blue)',
-    background: 'rgba(28,95,212,.1)', padding: '6px 12px', borderRadius: 999,
-  },
-  authBox: { background: '#f7f9fc', border: '1px solid var(--line)', borderRadius: 16, padding: 14, marginBottom: 16 },
-  authInfo: { fontSize: 13, color: 'var(--muted)', textAlign: 'center' },
-  authLoggedIn: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 13, fontWeight: 600 },
-  authEmail: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 240 },
-  authBtn: { border: 'none', background: 'var(--line)', color: 'var(--ink)', padding: '6px 12px', borderRadius: 8, fontSize: 12, fontWeight: 700 },
-  authForm: { display: 'flex', flexDirection: 'column', gap: 8 },
-  authTitle: { fontSize: 13, fontWeight: 700, color: 'var(--ink)', marginBottom: 2 },
-  authInput: { border: '1px solid var(--line)', borderRadius: 10, padding: '9px 12px', fontSize: 13, outline: 'none', background: '#fff' },
-  authActions: { display: 'flex', gap: 8, marginTop: 4 },
-  primaryAuthBtn: { flex: 1, background: 'var(--blue)', color: '#fff', border: 'none', borderRadius: 10, padding: '9px 12px', fontSize: 13, fontWeight: 700 },
-  secondaryAuthBtn: { background: 'transparent', color: 'var(--blue)', border: 'none', fontSize: 12, fontWeight: 700, cursor: 'pointer' },
-  errorText: { color: '#e53e3e', fontSize: 12, marginTop: 6, fontWeight: 600 },
-  section: { marginBottom: 16 },
-  sectionTitle: { fontSize: 13, fontWeight: 700, color: 'var(--muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' },
-  memberRow: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 },
-  memberTag: {
-    display: 'inline-flex', alignItems: 'center', gap: 6,
-    background: '#eef2f9', color: 'var(--ink)', padding: '4px 10px', borderRadius: 99,
-    fontSize: 13, fontWeight: 600, border: '1px solid var(--line)',
-  },
-  memberRemove: {
-    background: 'transparent', border: 'none', color: 'var(--muted)', fontSize: 14, cursor: 'pointer', padding: 0, lineHeight: 1,
-  },
-  addExpenseForm: { display: 'flex', flexDirection: 'column', gap: 6 },
-  addRow: { display: 'flex', gap: 10 },
-  input: {
-    flex: 1, border: '1px solid var(--line)', borderRadius: 14, padding: '11px 14px',
-    fontSize: 14, outline: 'none', background: '#f7f9fc', color: 'var(--ink)',
-  },
-  addBtn: {
-    flex: 'none', width: 44, borderRadius: 14, border: 'none', color: '#fff', fontSize: 22, fontWeight: 700,
-    background: 'var(--blue)',
-    boxShadow: '0 10px 22px -8px rgba(28,95,212,.6)',
-  },
-  optionsGrid: { display: 'flex', flexDirection: 'column', gap: 10, background: '#f7f9fc', padding: 12, borderRadius: 14, border: '1px solid var(--line)', marginTop: 8 },
-  optionGroup: { display: 'flex', flexDirection: 'column', gap: 6 },
-  label: { fontSize: 12, fontWeight: 700, color: 'var(--muted)' },
-  select: {
-    border: '1px solid var(--line)', borderRadius: 10, padding: '8px 10px',
-    fontSize: 13.5, background: '#fff', color: 'var(--ink)', outline: 'none',
-  },
-  checkboxGroup: { display: 'flex', flexWrap: 'wrap', gap: 12 },
+  centerScreen: { minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg)' },
+  loadingCard: { background: '#fff', padding: 24, borderRadius: 16, boxShadow: '0 10px 25px rgba(0,0,0,0.05)', fontWeight: 600 },
+  authScreen: { minHeight: '100vh', display: 'grid', placeItems: 'center', background: 'var(--bg)', padding: 16 },
+  authCard: { width: '100%', maxWidth: 420, background: 'var(--card)', borderRadius: 24, padding: 32, boxShadow: '0 20px 40px rgba(124, 58, 237, 0.08)', border: '1px solid var(--line)' },
+  brandRow: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 },
+  logo: { width: 40, height: 40, borderRadius: 12, background: 'linear-gradient(135deg, var(--primary), var(--cyan))', display: 'grid', placeItems: 'center', color: '#fff', fontWeight: 900, fontSize: 20 },
+  authHeading: { fontSize: 24, fontWeight: 900, letterSpacing: '-0.02em', margin: 0, color: 'var(--ink)' },
+  authSub: { color: 'var(--muted)', fontSize: 14, marginBottom: 24 },
+  authForm: { display: 'flex', flexDirection: 'column', gap: 16 },
+  formGroup: { display: 'flex', flexDirection: 'column', gap: 6 },
+  label: { fontSize: 13, fontWeight: 700, color: 'var(--ink)' },
+  input: { width: '100%', border: '1px solid var(--line)', borderRadius: 12, padding: '12px 14px', fontSize: 14, outline: 'none', background: '#f8f7fc', color: 'var(--ink)' },
+  select: { width: '100%', border: '1px solid var(--line)', borderRadius: 12, padding: '12px 14px', fontSize: 14, outline: 'none', background: '#f8f7fc', color: 'var(--ink)' },
+  primaryBtn: { width: '100%', background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 12, padding: '12px', fontSize: 15, fontWeight: 700, cursor: 'pointer', boxShadow: '0 4px 12px rgba(124, 58, 237, 0.25)' },
+  secondaryBtn: { background: 'var(--primary-light)', color: 'var(--primary)', border: 'none', borderRadius: 10, padding: '8px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
+  secondaryBtnWide: { width: '100%', background: 'var(--primary-light)', color: 'var(--primary)', border: 'none', borderRadius: 12, padding: '12px', fontSize: 15, fontWeight: 700, cursor: 'pointer' },
+  linkBtn: { background: 'transparent', border: 'none', color: 'var(--primary)', fontSize: 13, fontWeight: 700, cursor: 'pointer', textAlign: 'center', marginTop: 4 },
+  errorBox: { background: '#fef2f2', border: '1px solid #fee2e2', color: '#dc2626', padding: '12px 14px', borderRadius: 12, fontSize: 13, fontWeight: 600, marginTop: 12 },
+  successBox: { background: '#f0fdf4', border: '1px solid #dcfce7', color: '#16a34a', padding: '12px 14px', borderRadius: 12, fontSize: 13, fontWeight: 600, marginBottom: 16 },
+
+  // SaaS Dashboard Layout
+  dashboardLayout: { display: 'flex', minHeight: '100vh', background: 'var(--bg)' },
+  sidebar: { width: 260, background: 'var(--card)', borderRight: '1px solid var(--line)', display: 'flex', flexDirection: 'column', flex: 'none', position: 'sticky', top: 0, height: '100vh' },
+  sidebarBrand: { padding: '24px 20px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid var(--line)' },
+  sidebarTitle: { fontSize: 18, fontWeight: 900, color: 'var(--ink)' },
+  navMenu: { padding: '16px 12px', display: 'flex', flexDirection: 'column', gap: 6, flex: 1 },
+  navItem: { display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px', borderRadius: 12, border: 'none', background: 'transparent', color: 'var(--muted)', fontSize: 14, fontWeight: 700, cursor: 'pointer', textAlign: 'left', transition: 'all 0.2s' },
+  navItemActive: { background: 'var(--primary-light)', color: 'var(--primary)' },
+  sidebarFooter: { padding: 16, borderTop: '1px solid var(--line)', display: 'flex', flexDirection: 'column', gap: 10 },
+  userInfo: { fontSize: 13, color: 'var(--muted)', overflow: 'hidden' },
+  userEmailText: { display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 600 },
+  logoutBtn: { width: '100%', background: '#f1f5f9', color: '#475569', border: 'none', borderRadius: 10, padding: '10px', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
+
+  mainContent: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 },
+  header: { height: 72, background: 'var(--card)', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 32px', flex: 'none' },
+  pageTitle: { fontSize: 20, fontWeight: 900, color: 'var(--ink)', margin: 0 },
+  headerRight: { display: 'flex', alignItems: 'center', gap: 16 },
+  groupSelectorWrapper: { display: 'flex', alignItems: 'center', gap: 8 },
+  selectorLabel: { fontSize: 13, fontWeight: 700, color: 'var(--muted)' },
+  groupSelect: { border: '1px solid var(--line)', borderRadius: 10, padding: '8px 12px', fontSize: 13, fontWeight: 600, background: '#f8f7fc', color: 'var(--ink)', outline: 'none' },
+  headerActionBtn: { background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 10, padding: '8px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
+
+  contentScroll: { flex: 1, padding: 32, overflowY: 'auto' },
+
+  // Empty State
+  emptyGroupCard: { background: 'var(--card)', borderRadius: 24, padding: 48, textAlign: 'center', maxWidth: 540, margin: '60px auto', border: '1px solid var(--line)', boxShadow: '0 10px 30px rgba(0,0,0,0.02)' },
+  emptyIcon: { fontSize: 48, marginBottom: 16 },
+  emptyHeading: { fontSize: 22, fontWeight: 900, color: 'var(--ink)', marginBottom: 8 },
+  emptyText: { color: 'var(--muted)', fontSize: 14, lineHeight: 1.6, marginBottom: 24 },
+  emptyActionRow: { display: 'flex', justifyContent: 'center' },
+
+  // Dashboard Grid & Cards
+  dashboardGrid: { display: 'flex', flexDirection: 'column', gap: 24 },
+  groupCardBanner: { background: 'linear-gradient(135deg, #7c3aed, #a78bfa)', color: '#fff', borderRadius: 20, padding: '24px 28px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 12px 30px rgba(124, 58, 237, 0.2)' },
+  badge: { background: 'rgba(255,255,255,0.2)', padding: '4px 10px', borderRadius: 999, fontSize: 11, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.05em' },
+  groupBannerTitle: { fontSize: 24, fontWeight: 900, margin: '8px 0 4px 0' },
+  groupBannerSub: { fontSize: 13, opacity: 0.9, margin: 0 },
+
+  metricsGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 },
+  metricCard: { background: 'var(--card)', borderRadius: 16, padding: 20, border: '1px solid var(--line)', boxShadow: '0 4px 20px rgba(0,0,0,0.02)' },
+  metricIcon: { fontSize: 22, marginBottom: 8, display: 'block' },
+  metricLabel: { fontSize: 13, fontWeight: 700, color: 'var(--muted)', marginBottom: 4 },
+  metricValue: { fontSize: 24, fontWeight: 900, color: 'var(--ink)' },
+
+  dashboardTwoColumn: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 24 },
+  card: { background: 'var(--card)', borderRadius: 20, padding: 24, border: '1px solid var(--line)', boxShadow: '0 4px 20px rgba(0,0,0,0.02)', marginBottom: 24 },
+  sectionHeading: { fontSize: 16, fontWeight: 900, color: 'var(--ink)', marginBottom: 16, marginTop: 0 },
+  mutedText: { color: 'var(--muted)', fontSize: 14 },
+
+  quickActionsList: { display: 'flex', flexDirection: 'column', gap: 10 },
+  actionRowBtn: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#f8f7fc', border: '1px solid var(--line)', borderRadius: 12, padding: '12px 16px', fontSize: 14, fontWeight: 700, color: 'var(--ink)', cursor: 'pointer', transition: 'background 0.2s' },
+
+  miniExpenseList: { display: 'flex', flexDirection: 'column', gap: 12 },
+  miniExpenseItem: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 10, borderBottom: '1px solid var(--line)' },
+  miniExpName: { fontSize: 14, fontWeight: 700, color: 'var(--ink)' },
+  miniExpMeta: { fontSize: 12, color: 'var(--muted)' },
+  miniExpAmount: { fontSize: 15, fontWeight: 900, color: 'var(--ink)' },
+
+  // Expenses & Forms
+  sectionContainer: { display: 'flex', flexDirection: 'column', gap: 24 },
+  formGrid: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16, marginBottom: 16 },
+  formGridTwo: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 },
+  checkboxGroup: { display: 'flex', flexWrap: 'wrap', gap: 12, background: '#f8f7fc', padding: 12, borderRadius: 12, border: '1px solid var(--line)' },
   checkboxLabel: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 600, color: 'var(--ink)', cursor: 'pointer' },
-  list: { display: 'flex', flexDirection: 'column', gap: 10, minHeight: 60 },
-  empty: { color: 'var(--muted)', fontSize: '14px', textAlign: 'center', padding: '16px 0' },
-  item: {
-    display: 'flex', alignItems: 'center', gap: 12,
-    background: '#f7f9fc', border: '1px solid var(--line)', borderRadius: 16, padding: '12px 14px',
-  },
-  itemEmoji: {
-    width: 38, height: 38, borderRadius: 11, display: 'grid', placeItems: 'center',
-    background: '#fff', border: '1px solid var(--line)', fontSize: 19, flex: 'none',
-  },
-  itemMain: { flex: 1, minWidth: 0 },
-  itemName: { fontWeight: 700, fontSize: 15 },
-  itemPaid: { color: 'var(--muted)', fontSize: 12, marginTop: 2, lineHeight: 1.4 },
-  itemAmount: { fontWeight: 800, fontSize: 15.5, fontVariantNumeric: 'tabular-nums' },
-  remove: {
-    flex: 'none', width: 26, height: 26, borderRadius: 8, border: 'none',
-    background: 'transparent', color: 'var(--muted)', fontSize: 20, lineHeight: 1,
-  },
-  splitToggleBtn: {
-    width: '100%',
-    padding: '12px 16px',
-    borderRadius: 14,
-    border: '1px solid var(--blue)',
-    background: 'rgba(28,95,212,0.06)',
-    color: 'var(--blue)',
-    fontSize: 14,
-    fontWeight: 700,
-    cursor: 'pointer',
-    textAlign: 'center',
-    boxShadow: '0 4px 12px -4px rgba(28,95,212,.2)',
-  },
-  splitBox: {
-    marginTop: 10,
-    background: '#f7f9fc',
-    border: '1px solid var(--line)',
-    borderRadius: 16,
-    padding: 14,
-  },
-  subSectionTitle: {
-    fontSize: 12,
-    fontWeight: 700,
-    color: 'var(--muted)',
-    textTransform: 'uppercase',
-    letterSpacing: '0.05em',
-    marginBottom: 8,
-  },
-  balanceList: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-  },
-  balanceItem: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    fontSize: 13.5,
-    fontWeight: 600,
-    background: '#fff',
-    padding: '8px 12px',
-    borderRadius: 10,
-    border: '1px solid var(--line)',
-  },
-  settleList: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-  },
-  settleItem: {
-    background: '#fff',
-    padding: '9px 12px',
-    borderRadius: 10,
-    border: '1px solid var(--line)',
-    fontSize: 13.5,
-    color: 'var(--ink)',
-  },
-  total: {
-    textAlign: 'center', marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--line)',
-    fontWeight: 800, fontSize: 16, color: 'var(--ink)',
-  },
-  footnote: { color: 'var(--muted)', fontSize: 12.5, textAlign: 'center', lineHeight: 1.6, marginTop: 16, maxWidth: 420 },
+
+  expenseTable: { display: 'flex', flexDirection: 'column', gap: 12 },
+  expenseRowItem: { display: 'flex', alignItems: 'center', gap: 16, background: '#f8f7fc', border: '1px solid var(--line)', borderRadius: 16, padding: '14px 18px' },
+  expEmojiBox: { width: 40, height: 40, borderRadius: 10, background: '#fff', border: '1px solid var(--line)', display: 'grid', placeItems: 'center', fontSize: 20, flex: 'none' },
+  expDetails: { flex: 1, minWidth: 0 },
+  expName: { fontSize: 15, fontWeight: 800, color: 'var(--ink)' },
+  expSub: { fontSize: 12.5, color: 'var(--muted)', marginTop: 2 },
+  expAmount: { fontSize: 16, fontWeight: 900, color: 'var(--ink)', fontVariantNumeric: 'tabular-nums' },
+  deleteBtn: { background: 'transparent', border: 'none', color: 'var(--muted)', fontSize: 20, cursor: 'pointer', padding: 4 },
+
+  // Groups Tab
+  groupsGridTwo: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 24 },
+  groupListContainer: { display: 'flex', flexDirection: 'column', gap: 12 },
+  groupListItem: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#f8f7fc', border: '1px solid var(--line)', borderRadius: 16, padding: '16px 20px' },
+  groupListItemActive: { borderColor: 'var(--primary)', background: 'var(--primary-light)' },
+  groupItemName: { fontSize: 16, fontWeight: 900, color: 'var(--ink)', display: 'flex', alignItems: 'center', gap: 8 },
+  groupItemCode: { fontSize: 13, color: 'var(--muted)', marginTop: 4 },
+  groupItemActions: { display: 'flex', gap: 8 },
+  activePill: { background: 'var(--primary)', color: '#fff', fontSize: 10, fontWeight: 800, padding: '2px 8px', borderRadius: 999, textTransform: 'uppercase' },
+  smallBtn: { background: '#fff', border: '1px solid var(--line)', borderRadius: 8, padding: '6px 10px', fontSize: 12, fontWeight: 700, color: 'var(--ink)', cursor: 'pointer' },
+  primarySmallBtn: { background: 'var(--primary)', color: '#fff', border: 'none', borderRadius: 8, padding: '6px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer' },
+
+  // Settlements Tab
+  balanceGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16, marginTop: 12 },
+  balanceCardItem: { background: '#f8f7fc', border: '1px solid var(--line)', borderRadius: 16, padding: 18, textAlign: 'center' },
+  balPerson: { fontSize: 15, fontWeight: 800, color: 'var(--ink)', marginBottom: 6 },
+  balAmount: { fontSize: 15, fontWeight: 900 },
+  settleListContainer: { display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 },
+  settleRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#f8f7fc', border: '1px solid var(--line)', borderRadius: 12, padding: '14px 18px', fontSize: 14 },
+  settleAmountBadge: { background: 'var(--primary-light)', color: 'var(--primary)', padding: '4px 10px', borderRadius: 8, fontWeight: 900, fontSize: 15 },
 };
